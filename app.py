@@ -1,239 +1,341 @@
-from flask import Flask, render_template, request, redirect, url_for, session, flash,jsonify
+import os
 from datetime import datetime
-import sqlite3
-from collections import defaultdict
+from urllib.parse import quote_plus
+
+from dotenv import load_dotenv
+from flask import Flask, flash, jsonify, redirect, render_template, request, session, url_for
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func, text
+from werkzeug.security import check_password_hash, generate_password_hash
+
+load_dotenv()
+
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+
+def build_database_uri() -> str:
+    """Resolve database URI from environment (PostgreSQL on Azure) or local SQLite fallback."""
+    database_url = os.environ.get("DATABASE_URL", "").strip()
+
+    if not database_url and os.environ.get("PGHOST"):
+        pg_user = quote_plus(os.environ.get("PGUSER", ""))
+        pg_password = quote_plus(os.environ.get("PGPASSWORD", ""))
+        pg_host = os.environ["PGHOST"].strip()
+        pg_port = os.environ.get("PGPORT", "5432").strip()
+        pg_db = os.environ.get("PGDATABASE", "postgres").strip()
+        pg_ssl = os.environ.get("PGSSLMODE", "require").strip()
+        database_url = (
+            f"postgresql+psycopg://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}"
+            f"?sslmode={pg_ssl}"
+        )
+
+    if not database_url:
+        sqlite_path = os.path.join(BASE_DIR, "finance_tracker.db")
+        return f"sqlite:///{sqlite_path}"
+
+    # Normalize standard postgres URLs to SQLAlchemy + psycopg (v3) driver
+    if database_url.startswith("postgres://"):
+        database_url = "postgresql+psycopg://" + database_url[len("postgres://") :]
+    elif database_url.startswith("postgresql://"):
+        database_url = "postgresql+psycopg://" + database_url[len("postgresql://") :]
+
+    # Azure Database for PostgreSQL enforces SSL by default
+    if "postgres.database.azure.com" in database_url and "sslmode=" not in database_url:
+        separator = "&" if "?" in database_url else "?"
+        database_url = f"{database_url}{separator}sslmode=require"
+
+    return database_url
+
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-production")
 
-# SQLite database setup
-DATABASE = 'finance_tracker.db'
+database_uri = build_database_uri()
+app.config["SQLALCHEMY_DATABASE_URI"] = database_uri
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+if database_uri.startswith("postgresql"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "pool_pre_ping": True,
+        "pool_recycle": 300,
+    }
+
+db = SQLAlchemy(app)
+
+
+class User(db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(150), unique=True, nullable=False)
+    email = db.Column(db.String(255), nullable=False)
+    phone = db.Column(db.String(50), nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+
+
+class Transaction(db.Model):
+    __tablename__ = "transactions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    amount = db.Column(db.Float, nullable=False)
+    category = db.Column(db.String(100), nullable=False)
+    date = db.Column(db.String(20), nullable=False)
+    description = db.Column(db.Text)
+    payment_method = db.Column(db.String(50), nullable=False)
+
+    def to_tuple(self):
+        return (
+            self.id,
+            self.user_id,
+            self.amount,
+            self.category,
+            self.date,
+            self.description or "",
+            self.payment_method,
+        )
+
 
 def init_db():
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            email TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            password TEXT NOT NULL
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            category TEXT NOT NULL,
-            date TEXT NOT NULL,
-            description TEXT,
-            payment_method TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with app.app_context():
+        db.create_all()
+
 
 init_db()
 
-@app.route('/')
+
+@app.route("/health")
+def health():
+    try:
+        db.session.execute(text("SELECT 1"))
+        backend = "postgresql" if database_uri.startswith("postgresql") else "sqlite"
+        return jsonify({"status": "ok", "database": backend}), 200
+    except Exception as exc:
+        return jsonify({"status": "error", "detail": str(exc)}), 500
+
+
+@app.route("/")
 def index():
-    if 'username' in session:
-        user_id = session['user_id']
-        username = session['username']
-        
-        # Fetch transactions from the database
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM transactions WHERE user_id = ?", (user_id,))
-        transactions = c.fetchall()
-        
-        # Compute the sum of transaction amounts for each payment method
-        total_amount = sum(transaction[2] for transaction in transactions)
-        total_upi = sum(transaction[2] for transaction in transactions if transaction[6] == 'UPI')
-        total_cash = sum(transaction[2] for transaction in transactions if transaction[6] == 'Cash')
-        
-        conn.close()
+    if "user_id" in session and "username" in session:
+        user_id = session["user_id"]
+        username = session["username"]
 
-        return render_template('index.html', username=username, total_amount=total_amount, total_upi=total_upi, total_cash=total_cash)
-    return redirect(url_for('login'))
+        user_transactions = Transaction.query.filter_by(user_id=user_id).all()
+
+        total_amount = sum(t.amount for t in user_transactions)
+        total_upi = sum(t.amount for t in user_transactions if t.payment_method == "UPI")
+        total_cash = sum(t.amount for t in user_transactions if t.payment_method == "Cash")
+
+        return render_template(
+            "index.html",
+            username=username,
+            total_amount=total_amount,
+            total_upi=total_upi,
+            total_cash=total_cash,
+        )
+    return redirect(url_for("login"))
 
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT id, username FROM users WHERE username = ? AND password = ?", (username, password))
-        user = c.fetchone()
-        conn.close()
-        if user:
-            session['user_id'] = user[0]  # Store user_id in session
-            session['username'] = user[1]  # Store username in session
-            return redirect(url_for('index'))
-        else:
-            flash('Invalid username or password. Please try again.', 'error')
-    return render_template('login.html')
+    if request.method == "POST":
+        username = request.form["username"].strip()
+        password = request.form["password"]
+
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password, password):
+            session["user_id"] = user.id
+            session["username"] = user.username
+            return redirect(url_for("index"))
+
+        flash("Invalid username or password. Please try again.", "danger")
+    return render_template("login.html")
 
 
-@app.route('/logout')
+@app.route("/logout")
 def logout():
-    session.pop('username', None)
-    return redirect(url_for('login'))
+    session.clear()
+    return redirect(url_for("login"))
 
-@app.route('/register', methods=['GET', 'POST'])
+
+@app.route("/register", methods=["GET", "POST"])
 def register():
-    if request.method == 'POST':
-        username = request.form['username']
-        email = request.form['email']
-        phone = request.form['phone']
-        password = request.form['password']
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM users WHERE username = ?", (username,))
-        existing_user = c.fetchone()
+    if request.method == "POST":
+        username = request.form["username"].strip()
+        email = request.form["email"].strip()
+        phone = request.form["phone"].strip()
+        password = request.form["password"]
+
+        existing_user = User.query.filter_by(username=username).first()
         if existing_user:
-            flash('Username already exists. Please choose a different one.', 'error')
+            flash("Username already exists. Please choose a different one.", "danger")
         else:
-            c.execute("INSERT INTO users (username, email, phone, password) VALUES (?, ?, ?, ?)",
-                      (username, email, phone, password))
-            conn.commit()
-            conn.close()
-            flash('Registration successful! Please log in.', 'success')
-            return redirect(url_for('login'))
-    return render_template('register.html')
+            new_user = User(
+                username=username,
+                email=email,
+                phone=phone,
+                password=generate_password_hash(password),
+            )
+            db.session.add(new_user)
+            db.session.commit()
+            flash("Registration successful! Please log in.", "success")
+            return redirect(url_for("login"))
+    return render_template("register.html")
 
-@app.route('/transactions')
+
+@app.route("/transactions")
 def transactions():
-    if 'username' in session:
-        user_id = session['user_id']  # Assuming you store user_id in session
-        username = session['username']
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM transactions WHERE user_id = ?", (user_id,))
-        transactions = c.fetchall()
-        conn.close()
+    if "user_id" in session and "username" in session:
+        user_id = session["user_id"]
+        username = session["username"]
 
-        return render_template('transaction.html', transactions=transactions, username=username)
-    else:
-        return redirect(url_for('login'))
+        rows = (
+            Transaction.query.filter_by(user_id=user_id)
+            .order_by(Transaction.date.desc(), Transaction.id.desc())
+            .all()
+        )
+        transaction_tuples = [t.to_tuple() for t in rows]
+
+        return render_template(
+            "transaction.html", transactions=transaction_tuples, username=username
+        )
+    return redirect(url_for("login"))
 
 
-
-@app.route('/add_transaction', methods=['POST'])
+@app.route("/add_transaction", methods=["POST"])
 def add_transaction():
-    if 'username' in session:
-        user_id = session['user_id']  # Assuming you store user_id in session
-        date = request.form['date']
-        category = request.form['category']
-        amount = request.form['amount']
-        payment_method = request.form['payment_method']
-        description = request.form['notes']
+    if "user_id" in session and "username" in session:
+        user_id = session["user_id"]
+        date = request.form["date"]
+        category = request.form["category"]
+        try:
+            amount = float(request.form["amount"])
+        except ValueError:
+            flash("Invalid amount value.", "danger")
+            return redirect(url_for("transactions"))
+        payment_method = request.form["payment_method"]
+        description = request.form.get("notes", "")
 
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("INSERT INTO transactions (user_id, date, category, amount, payment_method, description) VALUES (?, ?, ?, ?, ?, ?)",
-                  (user_id, date, category, amount, payment_method, description))
-        conn.commit()
-        conn.close()
+        new_tx = Transaction(
+            user_id=user_id,
+            date=date,
+            category=category,
+            amount=amount,
+            payment_method=payment_method,
+            description=description,
+        )
+        db.session.add(new_tx)
+        db.session.commit()
 
-        return redirect(url_for('transactions'))
-    else:
-        return redirect(url_for('login'))
-    
-@app.route('/delete_transaction/<int:transaction_id>', methods=['POST'])
+        return redirect(url_for("transactions"))
+    return redirect(url_for("login"))
+
+
+@app.route("/delete_transaction/<int:transaction_id>", methods=["POST"])
 def delete_transaction(transaction_id):
-    if 'username' in session:
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
-        conn.commit()
-        conn.close()
-        flash('Transaction deleted successfully.', 'success')
+    if "user_id" in session and "username" in session:
+        user_id = session["user_id"]
+        tx = Transaction.query.filter_by(id=transaction_id, user_id=user_id).first()
+        if tx:
+            db.session.delete(tx)
+            db.session.commit()
+            flash("Transaction deleted successfully.", "success")
     else:
-        flash('You must be logged in to delete a transaction.', 'error')
-    return redirect(url_for('transactions'))
+        flash("You must be logged in to delete a transaction.", "danger")
+    return redirect(url_for("transactions"))
 
-@app.route('/daily_spending_data')
+
+@app.route("/daily_spending_data")
 def daily_spending_data():
-    if 'username' in session:
-        user_id = session['user_id']
-        
-        # Fetch daily spending data from the database
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT date, SUM(amount) FROM transactions WHERE user_id = ? GROUP BY date", (user_id,))
-        data = c.fetchall()
-        conn.close()
+    if "user_id" in session:
+        user_id = session["user_id"]
 
-        # Format data for Chart.js
+        data = (
+            db.session.query(Transaction.date, func.sum(Transaction.amount))
+            .filter(Transaction.user_id == user_id)
+            .group_by(Transaction.date)
+            .order_by(Transaction.date.asc())
+            .all()
+        )
+
         labels = [row[0] for row in data]
-        amounts = [row[1] for row in data]
+        amounts = [float(row[1]) for row in data]
+        return jsonify({"labels": labels, "amounts": amounts})
+    return redirect(url_for("login"))
 
-        return jsonify({'labels': labels, 'amounts': amounts})
-    else:
-        return redirect(url_for('login'))
 
-@app.route('/monthly_spending_data')
+@app.route("/monthly_spending_data")
 def monthly_spending_data():
-    if 'username' in session:
-        user_id = session['user_id']
-        
-        # Fetch monthly spending data from the database
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT strftime('%Y-%m', date) AS month, SUM(amount) FROM transactions WHERE user_id = ? GROUP BY month", (user_id,))
-        data = c.fetchall()
-        conn.close()
+    if "user_id" in session:
+        user_id = session["user_id"]
 
-        # Format data for Chart.js
-        labels = [datetime.strptime(row[0], '%Y-%m').strftime('%b %Y') for row in data]
-        amounts = [row[1] for row in data]
+        month_expr = func.substr(Transaction.date, 1, 7)
+        data = (
+            db.session.query(month_expr.label("month"), func.sum(Transaction.amount))
+            .filter(Transaction.user_id == user_id)
+            .group_by(month_expr)
+            .order_by(month_expr.asc())
+            .all()
+        )
 
-        return jsonify({'labels': labels, 'amounts': amounts})
-    else:
-        return redirect(url_for('login'))
-    
-    
-from flask import session
+        labels = []
+        amounts = []
+        for month_str, total in data:
+            try:
+                labels.append(datetime.strptime(month_str, "%Y-%m").strftime("%b %Y"))
+            except (TypeError, ValueError):
+                labels.append(str(month_str))
+            amounts.append(float(total))
 
-@app.route('/statistics')
+        return jsonify({"labels": labels, "amounts": amounts})
+    return redirect(url_for("login"))
+
+
+@app.route("/statistics")
 def statistics():
-    # Retrieve the user's identifier from the session
-    user_id = session.get('user_id')  # Assuming you store user ID in the session
-    
+    user_id = session.get("user_id")
+    username = session.get("username")
+
     if user_id:
-        # Fetch data for statistics page for the logged-in user from the database
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
+        total_expenses_result = (
+            db.session.query(func.sum(Transaction.amount))
+            .filter(Transaction.user_id == user_id)
+            .scalar()
+        )
+        total_expenses = float(total_expenses_result or 0)
 
-        # Fetch total expenses for the logged-in user
-        c.execute("SELECT SUM(amount) FROM transactions WHERE user_id = ?", (user_id,))
-        total_expenses_result = c.fetchone()
-        total_expenses = total_expenses_result[0] if total_expenses_result else 0
+        expense_by_category_result = (
+            db.session.query(Transaction.category, func.sum(Transaction.amount))
+            .filter(Transaction.user_id == user_id)
+            .group_by(Transaction.category)
+            .all()
+        )
+        expense_by_category = {
+            category: float(amount) for category, amount in expense_by_category_result
+        }
 
-        # Fetch expense breakdown by category for the logged-in user
-        c.execute("SELECT category, SUM(amount) FROM transactions WHERE user_id = ? GROUP BY category", (user_id,))
-        expense_by_category_result = c.fetchall()
-        expense_by_category = dict(expense_by_category_result) if expense_by_category_result else {}
+        top_spending_categories_result = (
+            db.session.query(Transaction.category, func.sum(Transaction.amount))
+            .filter(Transaction.user_id == user_id)
+            .group_by(Transaction.category)
+            .order_by(func.sum(Transaction.amount).desc())
+            .limit(5)
+            .all()
+        )
+        top_spending_categories = {
+            category: float(amount) for category, amount in top_spending_categories_result
+        }
 
-        # Fetch top spending categories for the logged-in user
-        c.execute("SELECT category, SUM(amount) FROM transactions WHERE user_id = ? GROUP BY category ORDER BY SUM(amount) DESC LIMIT 5", (user_id,))
-        top_spending_categories_result = c.fetchall()
-        top_spending_categories = dict(top_spending_categories_result) if top_spending_categories_result else {}
+        return render_template(
+            "statistics.html",
+            username=username,
+            total_expenses=total_expenses,
+            expense_by_category=expense_by_category,
+            top_spending_categories=top_spending_categories,
+        )
+    return redirect(url_for("login"))
 
-        conn.close()
 
-        # Render the statistics page template with the fetched data
-        return render_template('statistics.html', total_expenses=total_expenses, expense_by_category=expense_by_category,
-                               top_spending_categories=top_spending_categories)
-    else:
-        # Redirect to login page if user is not logged in
-        return redirect(url_for('login'))
-
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug)
